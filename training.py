@@ -223,9 +223,12 @@ class PolicyState:
 
 
 def make_policy_state(env: SequentialEvidenceEnv) -> PolicyState:
-    question = torch.as_tensor(env.question_embedding, dtype=torch.float32)
+    # Cached embeddings are memory-mapped read-only arrays. ``torch.tensor``
+    # makes a writable copy and avoids undefined behavior warnings from
+    # ``torch.as_tensor``.
+    question = torch.tensor(np.asarray(env.question_embedding), dtype=torch.float32)
     selected_vectors = [env.evidence_embeddings[item] for item in env.selected]
-    selected = torch.as_tensor(np.asarray(selected_vectors), dtype=torch.float32)
+    selected = torch.tensor(np.asarray(selected_vectors), dtype=torch.float32)
     if not selected_vectors:
         selected = torch.empty((0, question.numel()), dtype=torch.float32)
 
@@ -247,7 +250,7 @@ def make_policy_state(env: SequentialEvidenceEnv) -> PolicyState:
     return PolicyState(
         question=question,
         selected=selected,
-        candidate_base=torch.as_tensor(np.asarray(base_vectors), dtype=torch.float32),
+        candidate_base=torch.tensor(np.asarray(base_vectors), dtype=torch.float32),
         candidate_types=torch.tensor(types, dtype=torch.long),
         similarities=torch.tensor(similarities, dtype=torch.float32),
         action_mask=torch.ones(len(candidate_ids), dtype=torch.bool),
@@ -355,6 +358,9 @@ def train_supervised(
             torch.cuda.set_rng_state_all(checkpoint["cuda_random_state"])
 
     for epoch in range(start_epoch, epochs):
+        # Validation uses evaluation mode; every new epoch must explicitly
+        # restore training mode before the cuDNN GRU backward pass.
+        model.train()
         losses = []
         shuffled = list(question_ids)
         random.shuffle(shuffled)
@@ -421,16 +427,20 @@ def greedy_episode(
     env: SequentialEvidenceEnv,
     device: torch.device,
 ) -> tuple[list[str], float]:
+    was_training = model.training
     model.to(device).eval()
-    env.reset()
-    total_reward = 0.0
-    while not env.done:
-        state = make_policy_state(env).to(device)
-        logits, _ = policy_forward(model, state)
-        action_id = state.candidate_ids[int(torch.argmax(logits).item())]
-        _, reward, _, _ = env.step(action_id)
-        total_reward += reward
-    return list(env.selected), total_reward
+    try:
+        env.reset()
+        total_reward = 0.0
+        while not env.done:
+            state = make_policy_state(env).to(device)
+            logits, _ = policy_forward(model, state)
+            action_id = state.candidate_ids[int(torch.argmax(logits).item())]
+            _, reward, _, _ = env.step(action_id)
+            total_reward += reward
+        return list(env.selected), total_reward
+    finally:
+        model.train(was_training)
 
 
 def mean_greedy_evidence_f1(
