@@ -7,4 +7,6 @@ numpy>=1.26,<3.0
 PyYAML>=6.0,<7.0
 tqdm>=4.66,<5.0
 matplotlib>=3.8,<4.0
-ipykernel>=6.29,<9.0
+
+# Notebook runtimes (Colab/Jupyter/VS Code) provide their own compatible
+# ipykernel. Installing a different version here can break the host runtime.
