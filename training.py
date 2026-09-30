@@ -353,9 +353,11 @@ def train_supervised(
         if checkpoint.get("numpy_random_state") is not None:
             np.random.set_state(checkpoint["numpy_random_state"])
         if checkpoint.get("torch_random_state") is not None:
-            torch.set_rng_state(checkpoint["torch_random_state"])
+            torch.set_rng_state(checkpoint["torch_random_state"].cpu())
         if torch.cuda.is_available() and checkpoint.get("cuda_random_state") is not None:
-            torch.cuda.set_rng_state_all(checkpoint["cuda_random_state"])
+            torch.cuda.set_rng_state_all(
+                [state.cpu() for state in checkpoint["cuda_random_state"]]
+            )
 
     for epoch in range(start_epoch, epochs):
         # Validation uses evaluation mode; every new epoch must explicitly
@@ -750,9 +752,11 @@ def load_training_checkpoint(
         scheduler.load_state_dict(checkpoint["scheduler"])
     random.setstate(checkpoint["python_random_state"])
     np.random.set_state(checkpoint["numpy_random_state"])
-    torch.set_rng_state(checkpoint["torch_random_state"])
+    torch.set_rng_state(checkpoint["torch_random_state"].cpu())
     if torch.cuda.is_available() and checkpoint.get("cuda_random_state") is not None:
-        torch.cuda.set_rng_state_all(checkpoint["cuda_random_state"])
+        torch.cuda.set_rng_state_all(
+            [state.cpu() for state in checkpoint["cuda_random_state"]]
+        )
     return dict(checkpoint["progress"])
 
 
