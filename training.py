@@ -175,7 +175,12 @@ def build_environment_factory(
         example = examples_by_id[question_id]
         table_id = str(example["table_id"])
         generator = generator_cache[table_id]
-        types = {item_id: str(item["type"]) for item_id, item in evidence_by_id.items() if item_id in generator.items}
+        # Use the current table's items directly. Scanning the global evidence
+        # dictionary for every episode makes training unnecessarily quadratic.
+        types = {
+            str(item_id): str(item["type"])
+            for item_id, item in generator.items.items()
+        }
         return SequentialEvidenceEnv(
             question_id=question_id,
             question_embedding=question_embeddings[question_id],
@@ -317,33 +322,94 @@ def train_supervised(
     learning_rate: float,
     device: torch.device,
     validation_fn: Callable[[EvidenceActorCritic], float] | None = None,
+    batch_size: int = 32,
+    output_dir: str | Path | None = None,
 ) -> list[dict[str, float]]:
+    from tqdm.auto import tqdm
+
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
     model.to(device).train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     history: list[dict[str, float]] = []
     best_validation = -float("inf")
     best_state: dict[str, torch.Tensor] | None = None
-    for epoch in range(epochs):
+    start_epoch = 0
+    checkpoint_dir = Path(output_dir) if output_dir is not None else None
+    latest_path = checkpoint_dir / "latest_supervised.pt" if checkpoint_dir else None
+    if latest_path is not None and latest_path.exists():
+        checkpoint = torch.load(latest_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        history = list(checkpoint.get("history", []))
+        best_validation = float(checkpoint.get("best_validation", -float("inf")))
+        best_state = checkpoint.get("best_model")
+        start_epoch = int(checkpoint.get("epoch", 0))
+        if checkpoint.get("python_random_state") is not None:
+            random.setstate(checkpoint["python_random_state"])
+        if checkpoint.get("numpy_random_state") is not None:
+            np.random.set_state(checkpoint["numpy_random_state"])
+        if checkpoint.get("torch_random_state") is not None:
+            torch.set_rng_state(checkpoint["torch_random_state"])
+        if torch.cuda.is_available() and checkpoint.get("cuda_random_state") is not None:
+            torch.cuda.set_rng_state_all(checkpoint["cuda_random_state"])
+
+    for epoch in range(start_epoch, epochs):
         losses = []
         shuffled = list(question_ids)
         random.shuffle(shuffled)
-        for question_id in shuffled:
+        pending_losses: list[torch.Tensor] = []
+        progress = tqdm(shuffled, desc=f"supervised epoch {epoch + 1}/{epochs}")
+        optimizer.zero_grad(set_to_none=True)
+        for question_id in progress:
             loss = supervised_episode_loss(model, env_factory(question_id), device)
             if loss is None:
                 continue
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            losses.append(float(loss.detach().cpu()))
+            pending_losses.append(loss)
+            if len(pending_losses) >= batch_size:
+                torch.stack(pending_losses).mean().backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                pending_losses.clear()
+                progress.set_postfix(loss=f"{np.mean(losses[-100:]):.4f}")
+        if pending_losses:
+            torch.stack(pending_losses).mean().backward()
             nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
-            losses.append(float(loss.detach().cpu()))
         row = {"epoch": float(epoch + 1), "loss": float(np.mean(losses)) if losses else float("nan")}
+        improved = validation_fn is None
         if validation_fn is not None:
             validation = float(validation_fn(model))
             row["validation_evidence_f1"] = validation
             if validation > best_validation:
                 best_validation = validation
                 best_state = copy.deepcopy(model.state_dict())
+                improved = True
         history.append(row)
+        if checkpoint_dir is not None:
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            if improved:
+                best_path = checkpoint_dir / "best_model.pt"
+                best_temporary = best_path.with_suffix(best_path.suffix + ".tmp")
+                torch.save(best_state or model.state_dict(), best_temporary)
+                os.replace(best_temporary, best_path)
+            checkpoint = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch + 1,
+                "history": history,
+                "best_validation": best_validation,
+                "best_model": best_state,
+                "python_random_state": random.getstate(),
+                "numpy_random_state": np.random.get_state(),
+                "torch_random_state": torch.get_rng_state(),
+                "cuda_random_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            }
+            temporary = latest_path.with_suffix(latest_path.suffix + ".tmp")
+            torch.save(checkpoint, temporary)
+            os.replace(temporary, latest_path)
     if best_state is not None:
         model.load_state_dict(best_state)
     return history
@@ -482,54 +548,69 @@ def ppo_update(
     transitions: Sequence[Transition],
     device: torch.device,
     update_epochs: int = 4,
+    minibatch_size: int = 128,
     clip_ratio: float = 0.2,
     value_coefficient: float = 0.5,
     entropy_coefficient: float = 0.01,
     max_grad_norm: float = 0.5,
     target_kl: float = 0.03,
 ) -> dict[str, float]:
+    if minibatch_size < 1:
+        raise ValueError("minibatch_size must be positive")
     model.to(device).train()
     raw_advantages = torch.tensor([item.advantage for item in transitions], dtype=torch.float32)
     normalized = (raw_advantages - raw_advantages.mean()) / (raw_advantages.std(unbiased=False) + 1e-8)
-    last_metrics: dict[str, float] = {}
+    metric_rows: list[dict[str, float]] = []
     for _ in range(update_epochs):
-        policy_losses, value_losses, entropies, kls = [], [], [], []
         order = torch.randperm(len(transitions)).tolist()
-        for position in order:
-            item = transitions[position]
-            state = item.state.to(device)
-            logits, value = policy_forward(model, state)
-            distribution = Categorical(logits=logits)
-            action = torch.tensor(item.action_index, device=device)
-            new_log_probability = distribution.log_prob(action)
-            old_log_probability = torch.tensor(item.old_log_probability, device=device)
-            ratio = torch.exp(new_log_probability - old_log_probability)
-            advantage = normalized[position].to(device)
-            unclipped = ratio * advantage
-            clipped = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * advantage
-            policy_losses.append(-torch.minimum(unclipped, clipped))
-            target_value = torch.tensor(item.return_value, device=device)
-            value_losses.append((value - target_value).pow(2))
-            entropies.append(distribution.entropy())
-            kls.append(old_log_probability - new_log_probability)
-        policy_loss = torch.stack(policy_losses).mean()
-        value_loss = torch.stack(value_losses).mean()
-        entropy = torch.stack(entropies).mean()
-        approximate_kl = torch.stack(kls).mean()
-        loss = policy_loss + value_coefficient * value_loss - entropy_coefficient * entropy
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-        optimizer.step()
-        last_metrics = {
-            "policy_loss": float(policy_loss.detach().cpu()),
-            "value_loss": float(value_loss.detach().cpu()),
-            "entropy": float(entropy.detach().cpu()),
-            "approximate_kl": float(approximate_kl.detach().cpu()),
-        }
-        if float(approximate_kl.detach().cpu()) > target_kl:
+        epoch_kls: list[float] = []
+        for start in range(0, len(order), minibatch_size):
+            positions = order[start : start + minibatch_size]
+            policy_losses, value_losses, entropies, kls, clip_fractions = [], [], [], [], []
+            for position in positions:
+                item = transitions[position]
+                state = item.state.to(device)
+                logits, value = policy_forward(model, state)
+                distribution = Categorical(logits=logits)
+                action = torch.tensor(item.action_index, device=device)
+                new_log_probability = distribution.log_prob(action)
+                old_log_probability = torch.tensor(item.old_log_probability, device=device)
+                log_ratio = new_log_probability - old_log_probability
+                ratio = torch.exp(log_ratio)
+                advantage = normalized[position].to(device)
+                unclipped = ratio * advantage
+                clipped = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * advantage
+                policy_losses.append(-torch.minimum(unclipped, clipped))
+                target_value = torch.tensor(item.return_value, device=device)
+                value_losses.append((value - target_value).pow(2))
+                entropies.append(distribution.entropy())
+                kls.append((ratio - 1.0) - log_ratio)
+                clip_fractions.append((torch.abs(ratio - 1.0) > clip_ratio).float())
+            policy_loss = torch.stack(policy_losses).mean()
+            value_loss = torch.stack(value_losses).mean()
+            entropy = torch.stack(entropies).mean()
+            approximate_kl = torch.stack(kls).mean()
+            clip_fraction = torch.stack(clip_fractions).mean()
+            loss = policy_loss + value_coefficient * value_loss - entropy_coefficient * entropy
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+            row = {
+                "policy_loss": float(policy_loss.detach().cpu()),
+                "value_loss": float(value_loss.detach().cpu()),
+                "entropy": float(entropy.detach().cpu()),
+                "approximate_kl": float(approximate_kl.detach().cpu()),
+                "clip_fraction": float(clip_fraction.detach().cpu()),
+            }
+            metric_rows.append(row)
+            epoch_kls.append(row["approximate_kl"])
+        if epoch_kls and float(np.mean(epoch_kls)) > target_kl:
             break
-    return last_metrics
+    return {
+        name: float(np.mean([row[name] for row in metric_rows]))
+        for name in metric_rows[0]
+    }
 
 
 def train_ppo(
@@ -543,6 +624,8 @@ def train_ppo(
 ) -> list[dict[str, float]]:
     """Complete PPO loop. Intended for ``colab_gpu.ipynb`` only."""
 
+    from tqdm.auto import tqdm
+
     settings = config["training"]
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -550,7 +633,16 @@ def train_ppo(
     episode = 0
     best_validation = -float("inf")
     logs: list[dict[str, float]] = []
+    checks_without_improvement = 0
     checkpoint_every = int(settings["checkpoint_every_episodes"])
+    latest_path = output / "latest.pt"
+    if latest_path.exists():
+        progress = load_training_checkpoint(latest_path, model, optimizer, device=device)
+        episode = int(progress.get("episode", 0))
+        logs = list(progress.get("logs", []))
+        best_validation = float(progress.get("best_validation", -float("inf")))
+        checks_without_improvement = int(progress.get("checks_without_improvement", 0))
+    progress_bar = tqdm(total=int(settings["max_episodes"]), initial=episode, desc="PPO episodes")
     while episode < int(settings["max_episodes"]):
         rollout_size = min(int(settings["rollout_episodes"]), int(settings["max_episodes"]) - episode)
         sampled_ids = random.choices(list(question_ids), k=rollout_size)
@@ -569,6 +661,7 @@ def train_ppo(
             transitions,
             device,
             update_epochs=int(settings["update_epochs"]),
+            minibatch_size=int(settings.get("ppo_minibatch_size", 128)),
             clip_ratio=float(settings["clip_ratio"]),
             value_coefficient=float(settings["value_coefficient"]),
             entropy_coefficient=float(settings["entropy_coefficient"]),
@@ -579,15 +672,31 @@ def train_ppo(
         reward_mean = float(np.mean([row["total"] for row in episode_logs]))
         log_row = {"episode": float(episode), "reward": reward_mean, **update_metrics}
         logs.append(log_row)
+        progress_bar.update(rollout_size)
+        progress_bar.set_postfix(reward=f"{reward_mean:.4f}")
         should_checkpoint = episode % checkpoint_every < rollout_size or episode >= int(settings["max_episodes"])
         if should_checkpoint:
-            progress = {"episode": episode, "logs": logs}
-            save_training_checkpoint(output / "latest.pt", model, optimizer, progress, config)
             validation = validation_fn(model) if validation_fn is not None else reward_mean
             log_row["validation"] = float(validation)
-            if validation > best_validation:
+            improved = validation > best_validation
+            if improved:
                 best_validation = float(validation)
+                checks_without_improvement = 0
+            else:
+                checks_without_improvement += 1
+            progress = {
+                "episode": episode,
+                "logs": logs,
+                "best_validation": best_validation,
+                "checks_without_improvement": checks_without_improvement,
+            }
+            save_training_checkpoint(latest_path, model, optimizer, progress, config)
+            if improved:
                 save_training_checkpoint(output / "best.pt", model, optimizer, progress, config)
+            patience = int(settings.get("ppo_early_stopping_patience", 0))
+            if patience > 0 and checks_without_improvement >= patience:
+                break
+    progress_bar.close()
     return logs
 
 
