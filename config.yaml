@@ -1,0 +1,52 @@
+project:
+  seed: 42
+  device: auto
+
+paths:
+  hybridqa_root: data/raw/HybridQA
+  wikitables_root: data/raw/WikiTables-WithLinks
+  processed_dir: data/processed
+  output_dir: outputs
+
+data:
+  validation_fraction: 0.10
+  split_seed: 42
+  max_passage_chars: 12000
+
+models:
+  evidence_encoder: sentence-transformers/all-MiniLM-L6-v2
+  evidence_encoder_revision: null
+  answer_model: allenai/unifiedqa-t5-base
+  answer_model_revision: null
+  embedding_dim: 384
+  type_embedding_dim: 8
+  hidden_dim: 256
+  max_input_tokens: 512
+  max_output_tokens: 32
+
+candidates:
+  top_rows: 12
+  top_passages: 20
+  max_steps: 3
+
+training:
+  seeds: [13, 42, 2026]
+  supervised_learning_rate: 0.0003
+  ppo_learning_rate: 0.0003
+  rollout_episodes: 256
+  max_episodes: 50000
+  update_epochs: 4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_ratio: 0.20
+  value_coefficient: 0.5
+  entropy_coefficient: 0.01
+  max_grad_norm: 0.5
+  target_kl: 0.03
+  checkpoint_every_episodes: 2000
+
+rewards:
+  answer_weight: 1.0
+  evidence_weight: 1.0
+  step_cost: 0.02
+

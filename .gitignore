@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Notebook state
+.ipynb_checkpoints/
+
+# Data and generated artifacts
+data/raw/
+data/processed/
+outputs/
+
+# Model/download caches
+.cache/
+
