@@ -84,19 +84,19 @@ passage candidates. The policy may select at most three evidence items.
 ## Sequential decision process
 
 Evidence selection is represented as a finite-horizon Markov Decision Process.
-At step \(t\), the state is
+At step $t$, the state is
 
-\[
+$$
 s_t = (q, E_t, C_t, t),
-\]
+$$
 
-where \(q\) is the question embedding, \(E_t=(e_1,\ldots,e_t)\) is the ordered
-evidence history, and \(C_t\) is the dynamically generated candidate set. The
+where $q$ is the question embedding, $E_t=(e_1,\ldots,e_t)$ is the ordered
+evidence history, and $C_t$ is the dynamically generated candidate set. The
 action space is
 
-\[
+$$
 a_t \in C_t \cup \{\text{STOP}\}.
-\]
+$$
 
 Selecting evidence appends it to the history and updates the linked candidates.
 Selecting `STOP`, exhausting the candidates, or reaching three selections ends
@@ -106,26 +106,26 @@ the episode.
 
 The selected-evidence sequence is summarized by a GRU:
 
-\[
+$$
 h_t = \operatorname{GRU}(e_1,\ldots,e_t;	anh(W_q q)).
-\]
+$$
 
-For candidate \(c_i\), the actor receives
+For candidate $c_i$, the actor receives
 
-\[
+$$
 x_{t,i} = [q;h_t;c_i;q\odot c_i;h_t\odot c_i;
            \tau_i;\operatorname{sim}(q,c_i);t/T],
-\]
+$$
 
-where \(\tau_i\) is a learned row/passage/STOP type embedding. A masked MLP
+where $\tau_i$ is a learned row/passage/STOP type embedding. A masked MLP
 produces action logits and the policy
 
-\[
+$$
 \pi_\theta(a_i\mid s_t)
 = \operatorname{softmax}(f_\theta(x_{t,i})).
-\]
+$$
 
-The critic estimates \(V_\phi(s_t)\) from the question, GRU history, pooled
+The critic estimates $V_\phi(s_t)$ from the question, GRU history, pooled
 candidate representation, and normalized step index.
 
 ### Supervised initialization
@@ -134,43 +134,43 @@ The actor is first trained from weak evidence sets. Because valid evidence order
 is not uniquely known, every remaining member of a valid evidence set is
 accepted as a correct next action. If \(Y_t\) denotes the valid actions,
 
-\[
+$$
 \mathcal{L}_{\mathrm{sup}}
 = -\log\sum_{a\in Y_t}\pi_\theta(a\mid s_t).
-\]
+$$
 
 `STOP` becomes the target after a complete valid evidence set has been selected.
 PPO starts from the matching supervised checkpoint for each random seed.
 
 ## Reward design
 
-Let \(\Phi(E_t)\) be the best set-F1 between the selected evidence and any weak
+Let $\Phi(E_t)$ be the best set-F1 between the selected evidence and any weak
 gold alternative. Evidence reward is potential-based shaping:
 
-\[
+$$
 r_t^{\mathrm{evidence}} = \Phi(E_{t+1})-\Phi(E_t).
-\]
+$$
 
-At termination, the fixed answer model produces prediction \(\hat y\). The
+At termination, the fixed answer model produces prediction $\hat y$. The
 answer reward is
 
-\[
+$$
 r^{\mathrm{answer}}
 = \tfrac{1}{2}\operatorname{EM}(\hat y,y)
 + \tfrac{1}{2}F_1(\hat y,y).
-\]
+$$
 
 The complete reward is
 
-\[
+$$
 r_t = \alpha r_t^{\mathrm{answer}}
     + \beta r_t^{\mathrm{evidence}}
     - \lambda\,\mathbf{1}[a_t\neq\text{STOP}].
-\]
+$$
 
 Four controlled PPO variants were trained:
 
-| Variant | \(\alpha\) | \(\beta\) | \(\lambda\) |
+| Variant | $\alpha$ | $\beta$ | $\lambda$ |
 |---|---:|---:|---:|
 | Evidence only | 0 | 1 | 0 |
 | Answer only | 1 | 0 | 0 |
@@ -185,39 +185,39 @@ seen terminal states.
 
 Generalized Advantage Estimation is used:
 
-\[
+$$
 \delta_t=r_t+\gamma V(s_{t+1})-V(s_t),\qquad
 \hat A_t=\sum_{l=0}^{T-t-1}(\gamma\lambda_{\mathrm{GAE}})^l\delta_{t+l}.
-\]
+$$
 
 With probability ratio
 
-\[
+$$
 \rho_t(\theta)=
 \frac{\pi_\theta(a_t\mid s_t)}
      {\pi_{\theta_{\mathrm{old}}}(a_t\mid s_t)},
-\]
+$$
 
 the clipped policy objective is
 
-\[
+$$
 L^{\mathrm{clip}}(\theta)=
 \mathbb{E}_t\left[
 \min\left(
 \rho_t\hat A_t,
 \operatorname{clip}(\rho_t,1-\epsilon,1+\epsilon)\hat A_t
 \right)\right].
-\]
+$$
 
 The optimized loss combines the negative policy objective, value regression,
 and entropy regularization:
 
-\[
+$$
 \mathcal{L}
 =-L^{\mathrm{clip}}
 +c_v\,\mathbb{E}[(V_\phi(s_t)-\hat R_t)^2]
 -c_H\,\mathbb{E}[H(\pi_\theta(\cdot\mid s_t))].
-\]
+$$
 
 ## Training configuration
 
@@ -230,14 +230,14 @@ and entropy regularization:
 | Maximum evidence selections | 3 |
 | Supervised epochs | 3 |
 | Supervised batch size | 32 |
-| Supervised learning rate | \(3\times10^{-4}\) |
-| PPO learning rate | \(3\times10^{-4}\) |
+| Supervised learning rate | $3\times10^{-4}$ |
+| PPO learning rate | $3\times10^{-4}$ |
 | Rollout episodes/update | 256 |
 | PPO minibatch size | 128 |
 | Update epochs | 4 |
-| Discount \(\gamma\) | 0.99 |
-| GAE \(\lambda\) | 0.95 |
-| PPO clip \(\epsilon\) | 0.20 |
+| Discount $\gamma$ | 0.99 |
+| GAE $\lambda$ | 0.95 |
+| PPO clip $\epsilon$ | 0.20 |
 | Value coefficient | 0.5 |
 | Entropy coefficient | 0.01 |
 | Target approximate KL | 0.03 |
