@@ -1,5 +1,8 @@
 # PPO-Based Sequential Evidence Selection for HybridQA
 
+For the full mathematical derivation of the MDP, rewards, PPO/GAE losses,
+optimization sequence, and parameter choices, see [PPO_THEORY.md](PPO_THEORY.md).
+
 This repository investigates whether reinforcement learning can improve
 multi-hop question answering by learning **which evidence to select before a
 fixed answer model is invoked**. The central experiment compares direct
