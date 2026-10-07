@@ -43,46 +43,65 @@ Each HybridQA question defines a finite-horizon Markov Decision Process (MDP),
 (\mathcal{S}, \mathcal{A}, P, r, \gamma).
 \]
 
-- **State:**  
-  \[
-  s_t = (q, E_t, C_t, t),
-  \]
-  where \(q\) is the question representation, \(E_t = (e_1, \ldots, e_t)\) is the ordered history of selected evidence items, \(C_t\) is the current candidate evidence set, and \(t\) denotes the selection depth.
+- **State:**
 
-- **Action:**  
-  \[
-  a_t \in C_t \cup \{\mathrm{STOP}\}.
-  \]
-  An action corresponds to selecting either a table row or a linked passage from the current candidate set. Invalid or previously selected actions are masked from the action distribution.
+\[
+s_t = (q, E_t, C_t, t),
+\]
 
-- **Transition:**  
-  When an evidence item is selected, it is appended to the selection history:
-  \[
-  E_{t+1} = E_t \mathbin{\|} e_{t+1},
-  \]
-  where \(\mathbin{\|}\) denotes sequence concatenation. The candidate set is then updated according to the table structure and linked passages. The episode terminates when the agent selects \(\mathrm{STOP}\), when no valid candidates remain, or when three evidence items have been selected.
+where \(q\) is the question representation, \(E_t = (e_1, \ldots, e_t)\) is the ordered history of selected evidence items, \(C_t\) is the current candidate evidence set, and \(t\) denotes the selection depth.
 
-- **Reward:**  
-  The reward is defined as a configurable combination of the terminal answer reward, evidence-quality improvement, and, in one ablation setting, a cost associated with each evidence selection:
-  \[
-  r_t = r_t^{\text{answer}} + \lambda_{\text{ev}} r_t^{\text{evidence}}
-  - \lambda_{\text{cost}} r_t^{\text{cost}},
-  \]
-  where the weighting coefficients depend on the experimental configuration.
+- **Action:**
 
-- **Horizon:**  
-  The evidence-selection process has a maximum horizon of three selections:
-  \[
-  T \leq 3.
-  \]
+\[
+a_t \in C_t \cup \{\mathrm{STOP}\}.
+\]
+
+An action corresponds to selecting either a table row or a linked passage from the current candidate set. Invalid or previously selected actions are masked from the action distribution.
+
+- **Transition:**
+
+When an evidence item is selected, it is appended to the selection history:
+
+\[
+E_{t+1} = (e_1, \ldots, e_t, e_{t+1}).
+\]
+
+The candidate set is then updated according to the table structure and linked passages. The episode terminates when the agent selects \(\mathrm{STOP}\), when no valid candidates remain, or when three evidence items have been selected.
+
+- **Reward:**
+
+The reward is defined as a configurable combination of the terminal answer reward, evidence-quality improvement, and, in one ablation setting, a cost associated with each evidence selection:
+
+\[
+r_t
+=
+r_t^{\mathrm{answer}}
++
+\lambda_{\mathrm{ev}} r_t^{\mathrm{evidence}}
+-
+\lambda_{\mathrm{cost}} r_t^{\mathrm{cost}}.
+\]
+
+The weighting coefficients depend on the experimental configuration.
+
+- **Horizon:**
+
+The evidence-selection process has a maximum horizon of three selections:
+
+\[
+T \leq 3.
+\]
 
 The candidate-generation mechanism is shared across the similarity-based, supervised, and PPO selectors. Therefore, the PPO policy learns to choose among the candidates provided by the retrieval stage; it does not directly search over every table row or passage in the HybridQA corpus.
-## 3. State representation and Actor-Critic policy
+
+## 3. State Representation and Actor-Critic Policy
 
 The question embedding initializes a GRU-based history representation. Let \(z_q\) denote the question embedding and \(z_{e_i}\) the embedding of the \(i\)-th selected evidence item. The history representation is updated as
 
 \[
-h_0 = \tanh(W_q z_q), \qquad
+h_0 = \tanh(W_q z_q),
+\qquad
 h_t = \mathrm{GRU}(z_{e_t}, h_{t-1}).
 \]
 
@@ -104,8 +123,8 @@ h_t \odot z_{c_i};
 \]
 
 Here, \(\tau_i\) represents the candidate-type feature, \(\mathrm{sim}(q,c_i)\) denotes the similarity between the question and candidate, and \(H\) is the maximum selection horizon.
-An MLP scores each valid candidate and `STOP`. Applying the action mask and
-softmax gives
+
+An MLP scores each valid candidate and the \(\mathrm{STOP}\) action. After invalid actions are masked, a softmax is applied to obtain the final action probability distribution.
 
 $$
 \pi_\theta(a_i\mid s_t)=
