@@ -72,26 +72,29 @@ The candidate set is then updated according to the table structure and linked pa
 
 The reward is defined as a configurable combination of the terminal answer reward, evidence-quality improvement, and, in one ablation setting, a cost associated with each evidence selection:
 
+- **Reward:**
+
+The reward combines the final answer quality with the improvement obtained from selecting useful evidence. In the selection-cost ablation, an additional penalty is applied for each selected evidence item. The overall reward can be written as
+
 $$
-r_t
+R
 =
-r_t^{\mathrm{answer}}
+R_{\text{answer}}
 +
-\lambda_{\mathrm{ev}} r_t^{\mathrm{evidence}}
+\lambda_{\text{ev}} R_{\text{evidence}}
 -
-\lambda_{\mathrm{cost}} r_t^{\mathrm{cost}}.
+\lambda_{\text{cost}} R_{\text{cost}}.
 $$
 
-The weighting coefficients depend on the experimental configuration.
+Here, $\lambda_{\text{ev}}$ and $\lambda_{\text{cost}}$ control the contributions of the evidence-improvement reward and selection-cost penalty, respectively.
 
 - **Horizon:**
 
-The evidence-selection process has a maximum horizon of three selections:
+The agent can select at most three evidence items before the episode terminates:
 
 $$
 T \leq 3.
 $$
-
 The candidate-generation mechanism is shared across the similarity-based, supervised, and PPO selectors. Therefore, the PPO policy learns to choose among the candidates provided by the retrieval stage; it does not directly search over every table row or passage in the HybridQA corpus.
 
 ## 3. State Representation and Actor-Critic Policy
