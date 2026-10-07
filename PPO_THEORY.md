@@ -33,29 +33,28 @@ earns the configured reward. It is not directly trained to maximize answer F1
 on every evaluation question, and the frozen T5 parameters are not changed by
 PPO.
 
-## 2. The evidence-selection MDP
 
 ## 2. The Evidence-Selection MDP
 
 Each HybridQA question defines a finite-horizon Markov Decision Process (MDP),
 
-\[
+$$
 (\mathcal{S}, \mathcal{A}, P, r, \gamma).
-\]
+$$
 
 - **State:**
 
-\[
+$$
 s_t = (q, E_t, C_t, t),
-\]
+$$
 
-where \(q\) is the question representation, \(E_t = (e_1, \ldots, e_t)\) is the ordered history of selected evidence items, \(C_t\) is the current candidate evidence set, and \(t\) denotes the selection depth.
+where $q$ is the question representation, $E_t = (e_1, \ldots, e_t)$ is the ordered history of selected evidence items, $C_t$ is the current candidate evidence set, and $t$ denotes the selection depth.
 
 - **Action:**
 
-\[
+$$
 a_t \in C_t \cup \{\mathrm{STOP}\}.
-\]
+$$
 
 An action corresponds to selecting either a table row or a linked passage from the current candidate set. Invalid or previously selected actions are masked from the action distribution.
 
@@ -63,17 +62,17 @@ An action corresponds to selecting either a table row or a linked passage from t
 
 When an evidence item is selected, it is appended to the selection history:
 
-\[
+$$
 E_{t+1} = (e_1, \ldots, e_t, e_{t+1}).
-\]
+$$
 
-The candidate set is then updated according to the table structure and linked passages. The episode terminates when the agent selects \(\mathrm{STOP}\), when no valid candidates remain, or when three evidence items have been selected.
+The candidate set is then updated according to the table structure and linked passages. The episode terminates when the agent selects $\mathrm{STOP}$, when no valid candidates remain, or when three evidence items have been selected.
 
 - **Reward:**
 
 The reward is defined as a configurable combination of the terminal answer reward, evidence-quality improvement, and, in one ablation setting, a cost associated with each evidence selection:
 
-\[
+$$
 r_t
 =
 r_t^{\mathrm{answer}}
@@ -81,7 +80,7 @@ r_t^{\mathrm{answer}}
 \lambda_{\mathrm{ev}} r_t^{\mathrm{evidence}}
 -
 \lambda_{\mathrm{cost}} r_t^{\mathrm{cost}}.
-\]
+$$
 
 The weighting coefficients depend on the experimental configuration.
 
@@ -89,25 +88,25 @@ The weighting coefficients depend on the experimental configuration.
 
 The evidence-selection process has a maximum horizon of three selections:
 
-\[
+$$
 T \leq 3.
-\]
+$$
 
 The candidate-generation mechanism is shared across the similarity-based, supervised, and PPO selectors. Therefore, the PPO policy learns to choose among the candidates provided by the retrieval stage; it does not directly search over every table row or passage in the HybridQA corpus.
 
 ## 3. State Representation and Actor-Critic Policy
 
-The question embedding initializes a GRU-based history representation. Let \(z_q\) denote the question embedding and \(z_{e_i}\) the embedding of the \(i\)-th selected evidence item. The history representation is updated as
+The question embedding initializes a GRU-based history representation. Let $z_q$ denote the question embedding and $z_{e_i}$ the embedding of the $i$-th selected evidence item. The history representation is updated as
 
-\[
+$$
 h_0 = \tanh(W_q z_q),
 \qquad
 h_t = \mathrm{GRU}(z_{e_t}, h_{t-1}).
-\]
+$$
 
-For each candidate \(c_i\), the actor constructs an input representation by combining the question embedding, history representation, candidate embedding, elementwise interactions, candidate type, question-candidate similarity, and normalized selection step:
+For each candidate $c_i$, the actor constructs an input representation by combining the question embedding, history representation, candidate embedding, elementwise interactions, candidate type, question-candidate similarity, and normalized selection step:
 
-\[
+$$
 x_{t,i}
 =
 \left[
@@ -120,11 +119,11 @@ h_t \odot z_{c_i};
 \mathrm{sim}(q,c_i);
 \frac{t}{H}
 \right].
-\]
+$$
 
-Here, \(\tau_i\) represents the candidate-type feature, \(\mathrm{sim}(q,c_i)\) denotes the similarity between the question and candidate, and \(H\) is the maximum selection horizon.
+Here, $\tau_i$ represents the candidate-type feature, $\mathrm{sim}(q,c_i)$ denotes the similarity between the question and candidate, and $H$ is the maximum selection horizon.
 
-An MLP scores each valid candidate and the \(\mathrm{STOP}\) action. After invalid actions are masked, a softmax is applied to obtain the final action probability distribution.
+An MLP scores each valid candidate and the $\mathrm{STOP}$ action. After invalid actions are masked, a softmax is applied to obtain the final action probability distribution.
 
 $$
 \pi_\theta(a_i\mid s_t)=
