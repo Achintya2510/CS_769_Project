@@ -1,110 +1,119 @@
 # Theoretical Foundation and Optimization Details
 
-This note explains exactly what the PPO component learns, the mathematical
-objective it optimizes, how one update is formed, and why the configuration
-parameters matter. It describes the implemented evidence selector; it does not
-describe reinforcement learning of the answer-generation model.
+This note explains exactly what the PPO component learns, the mathematical objective it optimizes, how one update is formed, and why the configuration parameters matter. It describes the implemented evidence selector; it does not describe reinforcement learning of the answer-generation model.
 
-## 1. What is being optimized?
+## 1. What Is Being Optimized?
 
-The answer generator, `allenai/unifiedqa-t5-base`, is frozen. The evidence text
-encoder, `sentence-transformers/all-MiniLM-L6-v2`, is also frozen after it
-produces cached representations. PPO updates the trainable Actor-Critic selector
-initialized from the supervised selector. The selector learns a distribution
-over the next evidence item (or stopping) from the question and the evidence
-already selected.
+The answer generator, `allenai/unifiedqa-t5-base`, is frozen. The evidence text encoder, `sentence-transformers/all-MiniLM-L6-v2`, is also frozen after it produces cached representations. PPO updates the trainable Actor-Critic selector initialized from the supervised selector.
 
-For policy parameters \(\theta\), the central objective is the expected
-discounted return under the selection policy:
+The selector learns a distribution over the next evidence item, or stopping, based on the question and the evidence already selected.
 
-$$
-J(\theta) = \mathbb{E}_{\tau\sim\pi_\theta}\left[
-  \sum_{t=0}^{T-1} \gamma^t r_t
-\right],
-$$
+For policy parameters $\theta$, the central objective is the expected discounted return under the selection policy:
 
-where a trajectory \(\tau\) is a sequence of question-specific evidence
-selections and rewards, \(T\leq 3\) is the episode length, and \(\gamma\) is
-the reward discount. PPO is a practical, conservative way to improve this
-expected-return objective from sampled trajectories.
+```math
+J(\theta)
+=
+\mathbb{E}_{\tau \sim \pi_\theta}
+\left[
+\sum_{t=0}^{T-1} \gamma^t r_t
+\right].
+```
 
-The distinction is important: the policy is trained to choose evidence that
-earns the configured reward. It is not directly trained to maximize answer F1
-on every evaluation question, and the frozen T5 parameters are not changed by
-PPO.
+Here, a trajectory $\tau$ is a sequence of question-specific evidence selections and rewards, $T \leq 3$ is the episode length, and $\gamma$ is the reward discount factor.
 
+PPO provides a practical, conservative way to improve this expected-return objective using sampled trajectories.
+
+The distinction is important: the policy is trained to choose evidence that earns the configured reward. It is not directly trained to maximize answer F1 on every evaluation question, and the frozen T5 parameters are not changed by PPO.
 
 ## 2. The Evidence-Selection MDP
 
-Each HybridQA question defines a finite-horizon Markov Decision Process (MDP),
+Each HybridQA question defines a finite-horizon Markov Decision Process (MDP):
 
-$$
+```math
 (\mathcal{S}, \mathcal{A}, P, r, \gamma).
-$$
+```
 
 - **State:**
 
-$$
-s_t = (q, E_t, C_t, t),
-$$
+```math
+s_t = (q, E_t, C_t, t).
+```
 
-where $q$ is the question representation, $E_t = (e_1, \ldots, e_t)$ is the ordered history of selected evidence items, $C_t$ is the current candidate evidence set, and $t$ denotes the selection depth.
+Here, $q$ is the question representation, $E_t = (e_1,\ldots,e_t)$ is the ordered history of selected evidence items, $C_t$ is the current candidate evidence set, and $t$ denotes the current selection depth.
 
 - **Action:**
 
-$$
+```math
 a_t \in C_t \cup \{\mathrm{STOP}\}.
-$$
+```
 
-An action corresponds to selecting either a table row or a linked passage from the current candidate set. Invalid or previously selected actions are masked from the action distribution.
+An action corresponds to selecting either a table row or a linked passage from the current candidate set, or choosing $\mathrm{STOP}$.
+
+Invalid or previously selected actions are masked from the action distribution.
 
 - **Transition:**
 
 When an evidence item is selected, it is appended to the selection history:
 
-$$
-E_{t+1} = (e_1, \ldots, e_t, e_{t+1}).
-$$
-
-The candidate set is then updated according to the table structure and linked passages. The episode terminates when the agent selects $\mathrm{STOP}$, when no valid candidates remain, or when three evidence items have been selected.
-
-- **Reward:**
-
-The reward is defined as a configurable combination of the terminal answer reward, evidence-quality improvement, and, in one ablation setting, a cost associated with each evidence selection:
-
-- **Reward:**
-
-The reward combines the final answer quality with the improvement obtained from selecting useful evidence. In the selection-cost ablation, an additional penalty is applied for each selected evidence item:
-
 ```math
-R = R_{\text{answer}} + \lambda_{\text{ev}} R_{\text{evidence}} - \lambda_{\text{cost}} R_{\text{cost}}
+E_{t+1} = (e_1,\ldots,e_t,e_{t+1}).
 ```
 
-Here, $\lambda_{\text{ev}}$ and $\lambda_{\text{cost}}$ control the contributions of the evidence-improvement reward and selection-cost penalty, respectively.
+The candidate set is then updated according to the table structure and linked passages.
+
+The episode terminates when the agent selects $\mathrm{STOP}$, when no valid candidates remain, or when three evidence items have been selected.
+
+- **Reward:**
+
+The transition reward combines terminal answer quality, incremental evidence improvement, and, in the selection-cost ablation, a penalty for selecting additional evidence:
+
+```math
+r_t
+=
+\alpha R_{\mathrm{answer},t}
++
+\beta r_{t,\mathrm{evidence}}
+-
+\lambda \mathbf{1}[a_t \ne \mathrm{STOP}].
+```
+
+The contribution of each component depends on the reward variant being evaluated. The answer component is nonzero at episode termination, while the evidence component is computed after evidence-selection actions.
+
+The four reward configurations are described in Section 5.
 
 - **Horizon:**
 
-The agent can select at most three evidence items before the episode terminates:
+Let $H=3$ denote the maximum allowed selection horizon. The actual episode length $T$ therefore satisfies
 
 ```math
-T \leq 3
+T \leq H = 3.
 ```
 
 The candidate-generation mechanism is shared across the similarity-based, supervised, and PPO selectors. Therefore, the PPO policy learns to choose among the candidates provided by the retrieval stage; it does not directly search over every table row or passage in the HybridQA corpus.
 
 ## 3. State Representation and Actor-Critic Policy
 
-The question embedding initializes a GRU-based history representation. Let $z_q$ denote the question embedding and $z_{e_i}$ the embedding of the $i$-th selected evidence item. The history representation is updated as
+The question embedding initializes a GRU-based history representation.
 
-$$
-h_0 = \tanh(W_q z_q),
-\qquad
+Let $z_q$ denote the question embedding and $z_{e_i}$ the embedding of the $i$-th selected evidence item.
+
+The initial history representation is
+
+```math
+h_0 = \tanh(W_q z_q).
+```
+
+After evidence item $e_t$ is selected, the history representation is updated as
+
+```math
 h_t = \mathrm{GRU}(z_{e_t}, h_{t-1}).
-$$
+```
+
+Thus, $h_t$ provides a compact representation of the evidence-selection history.
 
 For each candidate $c_i$, the actor constructs an input representation by combining the question embedding, history representation, candidate embedding, elementwise interactions, candidate type, question-candidate similarity, and normalized selection step:
 
-$$
+```math
 x_{t,i}
 =
 \left[
@@ -117,307 +126,395 @@ h_t \odot z_{c_i};
 \mathrm{sim}(q,c_i);
 \frac{t}{H}
 \right].
-$$
+```
 
-Here, $\tau_i$ represents the candidate-type feature, $\mathrm{sim}(q,c_i)$ denotes the similarity between the question and candidate, and $H$ is the maximum selection horizon.
+Here:
 
-An MLP scores each valid candidate and the $\mathrm{STOP}$ action. After invalid actions are masked, a softmax is applied to obtain the final action probability distribution.
+- $z_{c_i}$ is the candidate embedding.
+- $z_q \odot z_{c_i}$ represents the elementwise interaction between the question and candidate.
+- $h_t \odot z_{c_i}$ represents the interaction between the selection history and candidate.
+- $\tau_i$ represents the candidate-type feature.
+- $\mathrm{sim}(q,c_i)$ is the question-candidate similarity score.
+- $t/H$ is the normalized selection depth.
+- $H=3$ is the maximum selection horizon.
 
-$$
-\pi_\theta(a_i\mid s_t)=
-\frac{\exp(f_\theta(x_{t,i}))}
-{\sum_{j\in\mathcal{A}(s_t)}\exp(f_\theta(x_{t,j}))}.
-$$
+An MLP scores each valid candidate and the $\mathrm{STOP}$ action. Invalid actions are masked, and a softmax is applied over the valid action logits to obtain the policy distribution:
 
-The critic estimates the state value \(V_\phi(s_t)\), the expected future
-discounted return from that state. Actor and critic share the state/history
-construction but have separate scoring heads. The value estimate is a training
-signal for lower-variance policy-gradient updates; it is not used as the final
-answer score.
+```math
+\pi_\theta(a_i \mid s_t)
+=
+\frac{\exp(\ell_{t,i})}
+{\sum_{a_j \in \mathcal{A}(s_t)} \exp(\ell_{t,j})}.
+```
 
-## 4. Supervised initialization objective
+Here, $\ell_{t,i}$ denotes the policy logit assigned to valid action $a_i$.
 
-Before PPO, the selector is trained using weak evidence sets. Since annotations
-can provide several acceptable evidence items without specifying a unique
-order, let \(Y_t\) be all currently available next actions that belong to at
-least one valid evidence set. The supervised action loss is the negative log
-probability assigned to the set of valid next actions:
+The critic estimates the state value
 
-$$
+```math
+V_\phi(s_t),
+```
+
+which represents the expected future discounted return from state $s_t$.
+
+The actor and critic share the state/history construction but have separate scoring heads. The value estimate is used as a training signal for lower-variance policy-gradient updates; it is not used as the final answer score.
+
+## 4. Supervised Initialization Objective
+
+Before PPO training, the selector is trained using weak evidence sets.
+
+Because annotations may provide several acceptable evidence items without specifying a unique order, let $Y_t$ denote all currently available next actions that belong to at least one valid evidence set.
+
+The supervised action loss is the negative log probability assigned to the set of valid next actions:
+
+```math
 \mathcal{L}_{\mathrm{sup}}(\theta)
-=-\log\left(\sum_{a\in Y_t}\pi_\theta(a\mid s_t)\right).
-$$
+=
+-\log
+\left(
+\sum_{a \in Y_t}
+\pi_\theta(a \mid s_t)
+\right).
+```
 
-After a complete valid set is collected, `STOP` is supervised. Each seed's
-supervised checkpoint initializes the PPO run with the matching seed. This
-reduces the burden of learning useful evidence actions from an initially
-uninformed policy, but also means the PPO result is a supervised-initialized
-policy rather than a from-scratch RL result.
+After a complete valid evidence set is collected, $\mathrm{STOP}$ is supervised.
 
-## 5. Reward objective and four ablations
+Each seed's supervised checkpoint initializes the PPO run with the matching seed.
 
-### 5.1 Answer reward
+This reduces the burden of learning useful evidence actions from an initially uninformed policy. It also means that the resulting PPO policy is a supervised-initialized policy rather than a policy learned from scratch using reinforcement learning.
 
-At a terminal state, the selected evidence is given to the fixed answer model.
-For normalized answer exact match \(\mathrm{EM}\) and token-level answer F1,
-the answer reward is
+## 5. Reward Objective and Four Ablations
 
-$$
-R_{\mathrm{answer}}=
-\tfrac{1}{2}\mathrm{EM}(\hat y,y)
-+\tfrac{1}{2}F_1(\hat y,y),
-$$
+### 5.1 Answer Reward
 
-where \(y\) is the reference and \(\hat y\) is the generated answer. It lies
-between zero and one. The answer model's output is cached for repeated
-question/evidence sequences to avoid duplicate inference during rollouts.
+At a terminal state, the selected evidence is given to the fixed answer-generation model.
 
-### 5.2 Evidence reward
+For normalized answer exact match $\mathrm{EM}$ and token-level answer F1, the answer reward is
 
-Let \(\Phi(E_t)\) be the maximum evidence set-F1 between the selected set and
-any weak gold alternative. On a non-STOP selection the implementation gives
-the change in this score:
+```math
+R_{\mathrm{answer}}
+=
+\frac{1}{2}\mathrm{EM}(\hat{y},y)
++
+\frac{1}{2}F_1(\hat{y},y).
+```
 
-$$
-r_{t,\mathrm{evidence}}=\Phi(E_{t+1})-\Phi(E_t).
-$$
+Here, $y$ is the reference answer and $\hat{y}$ is the generated answer.
 
-The reward can be positive for a useful item, zero if it does not change the
-best match, and negative if adding an item reduces precision enough to lower
-set-F1. The STOP action itself receives no evidence increment.
+The answer reward lies between zero and one.
 
-### 5.3 Combined per-step reward
+The answer model's output is cached for repeated question-evidence sequences to avoid duplicate inference during rollouts.
+
+### 5.2 Evidence Reward
+
+Let $\Phi(E_t)$ denote the maximum evidence set-F1 between the selected evidence set and any weak gold alternative.
+
+For a non-STOP selection, the implementation assigns the change in this score:
+
+```math
+r_{t,\mathrm{evidence}}
+=
+\Phi(E_{t+1})
+-
+\Phi(E_t).
+```
+
+The reward can be positive when the newly selected item improves the best evidence match, zero when it does not change the match, or negative when adding the item reduces precision enough to lower set-F1.
+
+The $\mathrm{STOP}$ action itself receives no evidence-improvement reward.
+
+### 5.3 Combined Per-Step Reward
 
 The transition reward is
 
-$$
-r_t=\alpha R_{\mathrm{answer},t}
-+\beta r_{t,\mathrm{evidence}}
--\lambda\,\mathbf{1}[a_t\ne\text{STOP}],
-$$
+```math
+r_t
+=
+\alpha R_{\mathrm{answer},t}
++
+\beta r_{t,\mathrm{evidence}}
+-
+\lambda \mathbf{1}[a_t \ne \mathrm{STOP}].
+```
 
-where the answer term is nonzero at episode termination, and the evidence term
-is nonzero on evidence-selection transitions. The step cost is charged for
-selecting an evidence item, not for stopping.
+The answer term is nonzero at episode termination, while the evidence term is nonzero on evidence-selection transitions.
 
-| Reward variant | \(\alpha\) | \(\beta\) | \(\lambda\) | What the ablation tests |
+The selection cost is charged when an evidence item is selected, not when the agent stops.
+
+| Reward variant | $\alpha$ | $\beta$ | $\lambda$ | What the ablation tests |
 |---|---:|---:|---:|---|
 | `answer_only` | 1 | 0 | 0 | Whether downstream answer reward alone can improve selection |
 | `evidence_only` | 0 | 1 | 0 | Whether weak evidence labels can train the sequential policy |
 | `combined` | 1 | 1 | 0 | Whether answer and evidence feedback complement one another |
 | `combined_step` | 1 | 1 | 0.02 | Whether a small per-selection cost reduces unnecessary selections |
 
-The reward variants are controlled ablations of the training signal. They do
-not change the evaluation metric or the answer model.
+The reward variants are controlled ablations of the training signal. They do not change the evaluation metric or the answer model.
 
-### 5.4 A shaping nuance
+### 5.4 A Shaping Nuance
 
-The implemented evidence reward is a difference in potential, but the classic
-policy-invariant potential-based shaping term for discount \(\gamma\) is
+The implemented evidence reward is a difference in potential. However, the classic policy-invariant potential-based shaping term for discount $\gamma$ is
 
-$$
-F(s_t,s_{t+1})=\gamma\Phi(s_{t+1})-\Phi(s_t).
-$$
+```math
+F(s_t,s_{t+1})
+=
+\gamma \Phi(s_{t+1})
+-
+\Phi(s_t).
+```
 
-The code uses \(\Phi(s_{t+1})-\Phi(s_t)\), while the PPO return discounts by
-\(\gamma=0.99\). Consequently, it should be described as **incremental evidence
-F1 reward** or **potential-difference reward**, not claimed to preserve the
-optimal policy by the standard shaping theorem. With undiscounted returns, the
-increments telescope to the terminal potential change; under discounted
-returns, they need not. This distinction matters when interpreting
-`evidence_only` and the evidence component of combined reward.
+The implementation instead uses
 
-## 6. PPO update: from sampled rollout to parameter update
+```math
+\Phi(s_{t+1})-\Phi(s_t),
+```
 
-For each update, the current policy samples up to 256 question episodes and
-stores states, actions, old action log-probabilities, rewards, terminal flags,
-and value estimates. The collected rollout is then reused for several
-optimization epochs.
+while the PPO return uses $\gamma=0.99$.
 
-### 6.1 Temporal-difference residual and GAE
+Consequently, this should be described as an **incremental evidence-F1 reward** or **potential-difference reward**, rather than being claimed to preserve the optimal policy under the standard potential-based shaping theorem.
 
-For a nonterminal transition, the one-step TD residual is
+With undiscounted returns, the increments telescope to the terminal potential change. Under discounted returns, they need not.
 
-$$
-\delta_t=r_t+\gamma V_\phi(s_{t+1})-V_\phi(s_t).
-$$
+This distinction matters when interpreting the `evidence_only` condition and the evidence component of the combined reward.
 
-At termination the next-state value is zero. Generalized Advantage Estimation
-(GAE) combines TD residuals at multiple horizons:
+## 6. PPO Update: From Sampled Rollout to Parameter Update
 
-$$
-\hat A_t=\sum_{l=0}^{T-t-1}(\gamma\lambda_{\mathrm{GAE}})^l\delta_{t+l},
-\qquad
-\hat R_t=\hat A_t+V_\phi(s_t).
-$$
+For each PPO update, the current policy samples up to 256 question episodes and stores states, actions, old action log-probabilities, rewards, terminal flags, and value estimates.
 
-The parameter \(\lambda_{\mathrm{GAE}}\) controls the bias-variance trade-off:
-lower values rely more on short-horizon TD estimates; values nearer one use
-longer reward traces and usually lower bias but higher variance. Here it is
-0.95.
+The collected rollout is then reused for several optimization epochs.
 
-### 6.2 Clipped policy surrogate
+### 6.1 Temporal-Difference Residual and GAE
 
-The probability ratio between updated and rollout policies is
+For a nonterminal transition, the one-step temporal-difference residual is
 
-$$
-\rho_t(\theta)=
-\frac{\pi_\theta(a_t\mid s_t)}
-{\pi_{\theta_{\mathrm{old}}}(a_t\mid s_t)}.
-$$
+```math
+\delta_t
+=
+r_t
++
+\gamma V_\phi(s_{t+1})
+-
+V_\phi(s_t).
+```
 
-PPO maximizes the clipped surrogate
+At termination, the next-state value is zero.
 
-$$
-L^{\mathrm{clip}}(\theta)=\mathbb{E}_t\left[
-\min\left(
-\rho_t(\theta)\hat A_t,
-\operatorname{clip}(\rho_t(\theta),1-\epsilon,1+\epsilon)\hat A_t
-\right)\right].
-$$
+Generalized Advantage Estimation (GAE) combines temporal-difference residuals over multiple horizons:
 
-Clipping limits how much the new policy can benefit from a large probability
-change on one sampled action. It is a surrogate trust-region constraint, not a
-hard guarantee that every policy distribution changes by at most
-\(\epsilon\).
+```math
+\hat{A}_t
+=
+\sum_{l=0}^{T-t-1}
+(\gamma \lambda_{\mathrm{GAE}})^l
+\delta_{t+l}.
+```
 
-### 6.3 Value loss and entropy bonus
+The corresponding return target is
 
-The critic is fit to the rollout return target with squared error:
+```math
+\hat{R}_t
+=
+\hat{A}_t
++
+V_\phi(s_t).
+```
 
-$$
-L_V(\phi)=\mathbb{E}_t[(V_\phi(s_t)-\hat R_t)^2].
-$$
+The parameter $\lambda_{\mathrm{GAE}}$ controls the bias-variance trade-off.
+
+Lower values rely more on short-horizon temporal-difference estimates. Values closer to one use longer reward traces and typically reduce bias at the cost of greater variance.
+
+In this experiment,
+
+```math
+\lambda_{\mathrm{GAE}} = 0.95.
+```
+
+### 6.2 Clipped Policy Surrogate
+
+The probability ratio between the updated policy and the rollout policy is
+
+```math
+\rho_t(\theta)
+=
+\frac{\pi_\theta(a_t \mid s_t)}
+{\pi_{\theta_{\mathrm{old}}}(a_t \mid s_t)}.
+```
+
+PPO maximizes the clipped surrogate objective
+
+```math
+L^{\mathrm{clip}}(\theta)
+=
+\mathbb{E}_t
+\left[
+\min
+\left(
+\rho_t(\theta)\hat{A}_t,
+\mathrm{clip}
+\left(
+\rho_t(\theta),
+1-\epsilon,
+1+\epsilon
+\right)
+\hat{A}_t
+\right)
+\right].
+```
+
+Clipping limits how much the updated policy can benefit from a large probability change on one sampled action.
+
+It acts as a surrogate trust-region constraint; it does not provide a hard guarantee that every policy probability changes by at most $\epsilon$.
+
+### 6.3 Value Loss and Entropy Bonus
+
+The critic is trained to predict the rollout return target using squared error:
+
+```math
+L_V(\phi)
+=
+\mathbb{E}_t
+\left[
+\left(
+V_\phi(s_t)-\hat{R}_t
+\right)^2
+\right].
+```
 
 Policy entropy is
 
-$$
-H(\pi_\theta(\cdot\mid s_t))
-=-\sum_a\pi_\theta(a\mid s_t)\log\pi_\theta(a\mid s_t).
-$$
+```math
+\mathcal{H}
+\left(
+\pi_\theta(\cdot \mid s_t)
+\right)
+=
+-
+\sum_a
+\pi_\theta(a \mid s_t)
+\log
+\pi_\theta(a \mid s_t).
+```
 
-Entropy rewards a less concentrated policy and helps retain exploration. The
-minimized joint loss is
+Entropy encourages a less concentrated action distribution and helps preserve exploration.
 
-$$
+The minimized joint loss is
+
+```math
 \mathcal{L}(\theta,\phi)
-=-L^{\mathrm{clip}}(\theta)
-+c_V L_V(\phi)
--c_H\mathbb{E}_t[H(\pi_\theta(\cdot\mid s_t))].
-$$
+=
+-
+L^{\mathrm{clip}}(\theta)
++
+c_V L_V(\phi)
+-
+c_H
+\mathbb{E}_t
+\left[
+\mathcal{H}
+\left(
+\pi_\theta(\cdot \mid s_t)
+\right)
+\right].
+```
 
-The negative sign on the entropy term means minimizing the loss encourages
-larger entropy. Gradients are clipped by global norm before the optimizer step.
+The negative sign on the entropy term means that minimizing the loss encourages larger entropy.
 
-## 7. Optimization sequence in this experiment
+Gradients are clipped by their global norm before the optimizer step.
 
-1. **Prepare representations:** frozen MiniLM encodes each evidence item and
-   question once. Embeddings and ID-to-row indexes are cached.
-2. **Train supervised selector:** for each configured seed, optimize the
-   multi-action weak-label likelihood for up to three epochs. Validation
-   evidence F1 selects `best_model.pt`.
-3. **Initialize PPO:** build the Actor-Critic and load that seed's supervised
-   actor weights. The critic is initialized by the model construction and
-   learned through PPO returns.
-4. **Collect rollouts:** sample actions from the current policy for batches of
-   question episodes, calculate the selected reward variant, and query the
-   frozen answer model only when the reward requires it.
-5. **Estimate returns:** compute TD residuals, GAE advantages, and value
-   targets from the sampled rollout.
-6. **Optimize several epochs:** shuffle rollout transitions, form minibatches,
-   compute clipped policy/value/entropy losses, clip gradient norm, and update
-   with Adam.
-7. **Stop an update early if needed:** target approximate KL limits excessive
-   drift from the rollout policy during optimization epochs.
-8. **Validate and checkpoint:** periodically evaluate greedy policy reward on
-   500 validation questions, retain the best validation checkpoint, save the
-   latest resumable state, and early-stop after five checks without improvement.
-9. **Evaluate once training is complete:** load each PPO best checkpoint and
-   evaluate the same official development questions with the fixed answerer.
+## 7. Optimization Sequence in This Experiment
 
-PPO optimizes a surrogate computed from on-policy samples; it does not
-differentiate through the text generator or through discrete evidence
-transitions. Answer feedback reaches the selector as scalar rewards.
+1. **Prepare representations:** Frozen MiniLM encodes each evidence item and question once. Embeddings and ID-to-row indexes are cached.
 
-## 8. Parameter values and their roles
+2. **Train the supervised selector:** For each configured seed, optimize the multi-action weak-label likelihood for up to three epochs. Validation evidence F1 selects `best_model.pt`.
 
-### PPO and reward parameters
+3. **Initialize PPO:** Build the Actor-Critic model and load the matching seed's supervised actor weights. The critic is initialized during model construction and learned through PPO return targets.
+
+4. **Collect rollouts:** Sample actions from the current policy for batches of question episodes, calculate the selected reward variant, and query the frozen answer model only when the reward requires it.
+
+5. **Estimate returns:** Compute temporal-difference residuals, GAE advantages, and value targets from the sampled rollout.
+
+6. **Optimize for several epochs:** Shuffle rollout transitions, form minibatches, compute clipped policy, value, and entropy losses, clip the gradient norm, and update the model using Adam.
+
+7. **Stop an update early if needed:** A target approximate KL threshold limits excessive drift from the rollout policy during repeated optimization epochs.
+
+8. **Validate and checkpoint:** Periodically evaluate greedy policy reward on 500 validation questions, retain the best validation checkpoint, save the latest resumable state, and early-stop after five validation checks without improvement.
+
+9. **Evaluate after training:** Load each PPO run's best checkpoint and evaluate it on the same official development questions using the fixed answer-generation model.
+
+PPO optimizes a surrogate objective computed from on-policy samples. It does not differentiate through the text generator or through the discrete evidence-selection transitions.
+
+Answer feedback reaches the selector only as scalar rewards.
+
+## 8. Parameter Values and Their Roles
+
+### PPO and Reward Parameters
 
 | Parameter | Value | Role and practical effect |
 |---|---:|---|
 | PPO learning rate | `3e-4` | Adam step size for Actor-Critic parameters. Too large can destabilize updates; too small can slow policy improvement. |
-| Rollout episodes | `256` | Number of question episodes collected per update. Larger rollouts improve reward estimates but cost more model/environment work and memory. |
-| PPO minibatch size | `128` | Number of transitions used for one gradient estimate. Smaller batches add noisy updates; larger batches are steadier but give fewer updates per rollout epoch. |
-| Update epochs | `4` | Number of passes over a rollout. More passes reuse samples more but increase overfitting to stale data and policy drift. |
-| Discount \(\gamma\) | `0.99` | Weights later reward relative to earlier reward. Near one is appropriate for a short episode where terminal answer reward matters. |
-| GAE \(\lambda_{\mathrm{GAE}}\) | `0.95` | Controls the horizon/bias-variance balance in advantage estimates. |
-| Clip \(\epsilon\) | `0.20` | Limits incentives for large action-probability changes in the surrogate. |
-| Value coefficient \(c_V\) | `0.5` | Balances critic regression against policy improvement. Too high can let value fitting dominate; too low weakens the baseline. |
-| Entropy coefficient \(c_H\) | `0.01` | Encourages action exploration. A larger value delays policy concentration; too large can prevent decisive selection. |
-| Max gradient norm | `0.5` | Clips the joint gradient to reduce damaging steps from unusually large gradients. |
-| Target approximate KL | `0.03` | Stops further PPO epochs for an update when policy drift is too large. Complements ratio clipping. |
+| Rollout episodes | `256` | Number of question episodes collected per update. Larger rollouts improve reward estimates but require more computation and memory. |
+| PPO minibatch size | `128` | Number of transitions used for one gradient estimate. Smaller batches produce noisier updates; larger batches are steadier but give fewer updates per rollout epoch. |
+| Update epochs | `4` | Number of passes over one rollout. More passes reuse samples more heavily but increase the risk of excessive policy drift. |
+| Discount $\gamma$ | `0.99` | Controls how strongly later rewards contribute relative to earlier rewards. |
+| GAE $\lambda_{\mathrm{GAE}}$ | `0.95` | Controls the bias-variance trade-off in advantage estimates. |
+| PPO clip $\epsilon$ | `0.20` | Limits incentives for large action-probability changes in the surrogate objective. |
+| Value coefficient $c_V$ | `0.5` | Balances critic regression against policy improvement. |
+| Entropy coefficient $c_H$ | `0.01` | Encourages exploration and discourages premature policy concentration. |
+| Maximum gradient norm | `0.5` | Clips the joint gradient norm to reduce destabilizing updates. |
+| Target approximate KL | `0.03` | Stops further PPO epochs during an update when policy drift becomes too large. |
 | Maximum episodes | `50,000` | Hard upper limit per run; it is not a target that every run must reach. |
 | Validation subset | `500` questions | Keeps periodic greedy validation tractable while providing a consistent stopping signal. |
 | Early-stopping patience | `5` checks | Stops a run after five validation checks without a new best score. |
-| Checkpoint interval | `2,000` episodes | Bounds lost work after interruption and preserves resumability. |
-| Seeds | `13, 42, 2026` | Repeats each learned method under different random initialization/sampling for a limited estimate of variability. |
+| Checkpoint interval | `2,000` episodes | Limits lost work after interruption and enables training to resume. |
+| Seeds | `13, 42, 2026` | Repeats each learned method under different random initialization and sampling conditions. |
 
-### Model and task parameters
+### Model and Task Parameters
 
 | Parameter | Value | Role |
 |---|---:|---|
 | Evidence/question embedding size | `384` | Frozen MiniLM vector dimension consumed by the selector. |
-| Actor/Critic hidden size | `256` | Capacity of the learned scoring/value MLPs. |
-| History model | GRU, size `384` | Encodes the order and content of prior selected evidence. |
-| Candidate rows | up to `12` | Limits row action candidates after similarity pre-filtering. |
-| Candidate passages | up to `20` | Limits linked passage candidates. |
-| Selection horizon | `3` | Maximum number of evidence items per answer. |
-| Supervised epochs | `3` | Training passes for the seed-matched PPO initialization. |
+| Actor/Critic hidden size | `256` | Capacity of the learned scoring and value-estimation MLPs. |
+| History model | GRU, size `384` | Encodes the order and content of previously selected evidence. |
+| Candidate rows | up to `12` | Limits table-row action candidates after similarity-based pre-filtering. |
+| Candidate passages | up to `20` | Limits linked-passage candidates. |
+| Selection horizon $H$ | `3` | Maximum number of evidence items that may be selected. |
+| Supervised epochs | `3` | Number of training passes for seed-matched supervised initialization. |
 | Supervised batch size | `32` | Number of episode losses accumulated before a supervised optimizer update. |
 | Supervised learning rate | `3e-4` | AdamW step size for weak-label selector initialization. |
-| Combined-step cost \(\lambda\) | `0.02` | Small penalty for each selected item; intended to test shorter chains. |
+| Combined-step cost $\lambda$ | `0.02` | Small penalty for every selected evidence item, used to test whether the policy learns shorter chains. |
 
-Parameter values are experimental choices, not universal optima. The experiment
-uses four reward ablations and three seeds, but does not conduct a broad
-hyperparameter sweep. Therefore, conclusions are conditional on this frozen
-configuration.
+These parameter values are experimental choices rather than universal optima.
 
-## 9. Interpreting the ablation outcomes
+The experiment uses four reward ablations and three random seeds, but it does not conduct a broad hyperparameter sweep. Therefore, conclusions are conditional on this fixed experimental configuration.
 
-The answer-only objective achieved the highest mean Answer F1 among tested PPO
-variants and a significant improvement over supervised selection. It selected
-more items on average and had lower weak-label Evidence F1 than supervised
-selection. This is consistent with optimizing the downstream answer reward:
-the selector may include evidence useful to the frozen generator even when that
-evidence does not match the weak gold IDs.
+## 9. Interpreting the Ablation Outcomes
 
-The step-cost variant selected fewer items than answer-only and the two
-combined variants, which is consistent with penalizing every evidence action.
-However, shorter chains alone do not establish higher efficiency at equal
-answer quality; answer score, evidence recall/precision, token count, and
-latency must be interpreted together.
+The `answer_only` objective achieved the highest mean Answer F1 among the tested PPO variants and a significant improvement over supervised selection.
 
-The evidence-only objective optimizes weak annotation alignment. Since the
-evidence labels are incomplete/noisy and the implemented increment is not the
-discount-corrected shaping term, its return is not identical to answer
-correctness or to complete-chain success.
+It selected more evidence items on average and obtained lower weak-label Evidence F1 than the supervised selector.
 
-## 10. Limits of the theoretical claim
+This is consistent with optimizing downstream answer reward: the selector may include evidence that is useful to the frozen answer generator even when that evidence does not match the weak gold evidence IDs.
 
-- PPO's clipped surrogate is a practical local update objective, not a proof of
-  global convergence or a strict trust region.
-- The critic and policy are trained from finite, correlated trajectories;
-  seed means and question-level bootstrap intervals quantify only part of the
-  uncertainty.
-- The discounted incremental evidence reward is not policy-invariant shaping
-  at \(\gamma<1\), as explained above.
-- Evidence F1 is computed against weak trace-derived alternatives. Low score
-  can reflect label mismatch as well as genuinely irrelevant selections.
-- The selector is optimized for one fixed answer model. A different generator
-  can prefer different evidence.
-- The 12 PPO runs were allowed to early-stop using validation reward. Their
-  episode counts differ; performance comparisons use the common held-out dev
-  evaluation, not final training episode reward.
+The `combined_step` variant selected fewer evidence items than `answer_only` and the two combined variants without a step cost. This behavior is consistent with penalizing each evidence-selection action.
+
+However, shorter chains alone do not establish greater efficiency at equal answer quality. Answer score, evidence recall and precision, token count, and inference latency should be interpreted together.
+
+The `evidence_only` objective optimizes alignment with the weak evidence annotations.
+
+Because these evidence labels may be incomplete or noisy, and because the implemented evidence increment is not the discount-corrected potential-based shaping term, its return is not equivalent to answer correctness or complete-chain success.
+
+## 10. Limits of the Theoretical Claim
+
+- PPO's clipped surrogate is a practical local update objective, not a proof of global convergence or a strict trust region.
+
+- The critic and policy are trained from finite, correlated trajectories. Seed means and question-level bootstrap intervals quantify only part of the uncertainty.
+
+- The discounted incremental evidence reward is not policy-invariant potential-based shaping when $\gamma < 1$, as discussed in Section 5.4.
+
+- Evidence F1 is computed against weak trace-derived alternatives. A low Evidence F1 score can reflect label mismatch as well as genuinely irrelevant evidence selection.
+
+- The selector is optimized for one fixed answer model. A different generator may prefer different evidence.
+
+- The 12 PPO runs are allowed to early-stop using validation reward. Their episode counts may therefore differ. Performance comparisons use the common held-out development evaluation rather than final training-episode reward.
 
 ## References
 
